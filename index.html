@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>가격 투명성 지도 프로젝트 - 공정한 소비 문화 확산</title>
+    <!-- Tailwind CSS CDN 로드 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+        body {
+            /* 무지 스타일: 배경은 흰색이나 아주 연한 회색 */
+            font-family: 'Inter', sans-serif;
+            background-color: #ffffff; /* 순백색 */
+            color: #333333; /* 짙은 회색 */
+        }
+        .section-title {
+            /* 제목은 굵게, 장식은 최소화 */
+            position: relative;
+            display: inline-block;
+            font-weight: 700; 
+            color: #1f2937;
+            padding-bottom: 8px;
+        }
+        .section-title::after {
+            /* 민트색(Teal) 계열의 얇은 밑줄만 사용 */
+            content: '';
+            position: absolute;
+            left: 0;
+            bottom: 0;
+            width: 100%;
+            height: 2px;
+            background-color: #14b8a6; /* Tailwind teal-500 */
+        }
+        .card {
+            /* 무지 스타일: 깔끔한 직사각형, 은은한 그림자 */
+            border: 1px solid #e5e7eb; /* Gray-200 */
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            transition: box-shadow 0.2s;
+        }
+        .card:hover {
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Firebase 전역 변수 설정 (Canvas 환경 변수 사용)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        const TARGET_PARTICIPANTS = 100;
+        let currentParticipants = 0; 
+        let hasJoinedThisSession = false; // 세션당 1회 제한 플래그
+        let db, auth;
+
+        // --- UI 업데이트 함수 ---
+        function updateParticipantCount() {
+            const countElement = document.getElementById('current-participants');
+            const progressElement = document.getElementById('progress-bar');
+            
+            if (countElement) {
+                countElement.textContent = currentParticipants.toLocaleString();
+            }
+
+            if (progressElement) {
+                const percentage = Math.min((currentParticipants / TARGET_PARTICIPANTS) * 100, 100);
+                progressElement.style.width = `${percentage}%`;
+                
+                if (percentage >= 100) {
+                    progressElement.classList.remove('bg-teal-500');
+                    progressElement.classList.add('bg-green-500');
+                } else {
+                    progressElement.classList.remove('bg-teal-500');
+                    progressElement.classList.add('bg-teal-500');
+                }
+            }
+            // 초기 로드 후 버튼 상태를 설정 (클릭 가능 상태)
+            const joinButton = document.getElementById('join-button');
+            if (joinButton && !hasJoinedThisSession) {
+                 joinButton.disabled = false;
+                 joinButton.textContent = "지금 바로 동참하기";
+            }
+        }
+
+        // --- Firebase 초기화 및 인증 ---
+        async function initializeFirebase() {
+            if (!firebaseConfig) {
+                console.error("Firebase config is missing.");
+                return;
+            }
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 1. 사용자 인증 (토큰 사용 또는 익명 로그인)
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // 2. 실시간 리스너 설정
+                setupCountListener(db);
+
+            } catch (error) {
+                console.error("Firebase initialization or authentication failed:", error);
+                // 실패 시 버튼 비활성화 (동작 불가)
+                document.getElementById('join-button').disabled = true;
+            }
+        }
+
+        // --- 실시간 동참자 수 리스너 설정 ---
+        function setupCountListener(db) {
+            // 공개 데이터 경로: /artifacts/{appId}/public/data/participant_count/count_data
+            const countRef = doc(db, "artifacts", appId, "public", "data", "participant_count", "count_data");
+            
+            onSnapshot(countRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    currentParticipants = docSnap.data().count || 0;
+                } else {
+                    currentParticipants = 0;
+                }
+                updateParticipantCount();
+            }, (error) => {
+                console.error("Error fetching participant count:", error);
+            });
+        }
+
+        // --- 동참하기 버튼 클릭 핸들러 (트랜잭션) ---
+        async function handleJoinClick() {
+            if (hasJoinedThisSession || !db) {
+                // 이미 동참했거나 DB가 준비되지 않은 경우
+                return;
+            }
+
+            const joinButton = document.getElementById('join-button');
+            joinButton.disabled = true; // 트랜잭션 진행 중 버튼 비활성화
+
+            const countRef = doc(db, "artifacts", appId, "public", "data", "participant_count", "count_data");
+
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const countDoc = await transaction.get(countRef);
+                    let newCount = 1;
+                    
+                    if (countDoc.exists()) {
+                        const currentCount = countDoc.data().count || 0;
+                        newCount = currentCount + 1;
+                    }
+                    
+                    // 새로운 카운트를 저장
+                    transaction.set(countRef, { count: newCount });
+                });
+
+                // 성공: 상태 업데이트 및 모달 표시
+                hasJoinedThisSession = true;
+                joinButton.textContent = "참여 완료!";
+                joinButton.classList.add('opacity-60', 'cursor-not-allowed');
+
+                const modal = document.getElementById('join-modal');
+                modal.classList.remove('hidden');
+
+            } catch (error) {
+                console.error("동참 트랜잭션 실패:", error);
+                // 실패 시 버튼 재활성화
+                joinButton.disabled = false; 
+                joinButton.textContent = "지금 바로 동참하기";
+            }
+        }
+        
+        // --- 초기 로딩 ---
+        window.onload = function() {
+            // 초기 버튼 상태 설정 (로딩 중)
+            const joinButton = document.getElementById('join-button');
+            joinButton.disabled = true;
+            joinButton.textContent = "로딩 중...";
+
+            // 동참하기 버튼에 이벤트 리스너 연결
+            joinButton.addEventListener('click', handleJoinClick);
+            document.getElementById('close-modal').addEventListener('click', closeModal);
+
+            // Firebase 초기화 시작
+            initializeFirebase();
+        };
+
+        function closeModal() {
+            document.getElementById('join-modal').classList.add('hidden');
+        }
+    </script>
+</head>
+<body class="text-gray-800">
+
+    <!-- 모달: 동참하기 클릭 시 -->
+    <div id="join-modal" class="fixed inset-0 bg-gray-600 bg-opacity-50 hidden flex items-center justify-center p-4 z-50">
+        <div class="bg-white p-8 rounded-lg shadow-2xl max-w-sm w-full animate-in zoom-in duration-300 card">
+            <h3 class="text-xl font-bold mb-3 text-teal-600">참여해주셔서 감사합니다!</h3>
+            <p class="mb-5 text-gray-700">투명한 시장을 만드는 프로젝트에 귀하의 동참이 큰 힘이 됩니다.</p>
+            <button id="close-modal" class="w-full bg-teal-500 hover:bg-teal-600 text-white font-semibold py-2 rounded-lg transition duration-150">확인</button>
+        </div>
+    </div>
+
+    <!-- 헤더 -->
+    <header class="bg-white shadow-sm border-b border-gray-100 sticky top-0 z-10">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex justify-between items-center">
+            <h1 class="text-2xl font-bold text-teal-700">가격 투명성 지도</h1>
+            <nav class="space-x-4 hidden md:block">
+                <a href="#home" class="text-gray-600 hover:text-teal-600 font-medium p-2">홈</a>
+                <a href="#intro" class="text-gray-600 hover:text-teal-600 font-medium p-2">소개</a>
+                <a href="#legal" class="text-gray-600 hover:text-teal-600 font-medium p-2">법적 근거</a>
+            </nav>
+        </div>
+    </header>
+
+    <!-- 1. 메인 섹션 (Home) -->
+    <main id="home" class="max-w-6xl mx-auto p-4 sm:p-8">
+        
+        <!-- 슬로건 및 동참 버튼 -->
+        <div class="text-center my-12 py-4">
+            <h2 class="text-3xl sm:text-4xl font-extrabold text-gray-900 mb-6 leading-relaxed">
+                <span class="text-teal-600">투명하고 정직한 소비 문화</span> 확산에 동참해주세요.
+            </h2>
+            <p class="text-lg text-gray-600 mb-8 max-w-3xl mx-auto">
+                우리는 가격 정보의 투명성을 확보하고, 정직한 가게를 선택하는 윤리적 소비를 실천합니다.
+            </p>
+            <button id="join-button" class="bg-teal-500 hover:bg-teal-600 text-white font-bold text-lg py-3 px-8 rounded-full transition duration-300 transform hover:scale-105 shadow-md hover:shadow-lg disabled:opacity-60 disabled:cursor-not-allowed" disabled>
+                로딩 중...
+            </button>
+        </div>
+        
+        <!-- 동참자 현황 및 목표 -->
+        <div class="bg-white p-6 card mb-12">
+            <!-- '첫 달 목표'를 '목표'로 변경 -->
+            <h3 class="text-xl font-bold text-gray-700 mb-4">참여 현황 <span class="text-sm font-medium text-teal-500">(목표 100명)</span></h3>
+            <div class="flex justify-between items-center mb-2">
+                <span class="text-base font-semibold text-gray-600">현재 동참자</span>
+                <span class="text-2xl font-extrabold text-teal-600" id="current-participants">0</span>
+            </div>
+            <div class="w-full bg-gray-200 rounded-full h-3">
+                <div id="progress-bar" class="bg-teal-500 h-3 rounded-full transition-all duration-700 ease-out" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- 지도 섹션 -->
+        <div class="bg-white p-6 card">
+            <h3 class="text-2xl section-title mb-8 text-gray-800">충남대 주변 가격 투명성 지도</h3>
+            
+            <!-- 지도 Placeholder -->
+            <div class="aspect-video bg-gray-100 rounded-lg overflow-hidden border border-gray-300">
+                <!-- 이미지 URL을 사용하여 지도를 시각적으로 표현 -->
+                <img src="https://placehold.co/1200x675/ccfbf1/0d9488?text=Interactive+Map+(%EC%B6%A9%EB%8C%80+%EC%A3%BC%EB%B3%80+%ED%97%AC%EC%8A%A4%EC%9E%A5)" 
+                     alt="가격 명시 지도 플레이스홀더" 
+                     class="w-full h-full object-cover"
+                     onerror="this.onerror=null; this.src='https://placehold.co/1200x675/ccfbf1/0d9488?text=지도+표시+불가';"
+                >
+            </div>
+            
+            <!-- 지도 필터 버튼 (정문, 서문, 쪽문별) - 무지 스타일로 간결하게 -->
+            <div class="mt-6 flex flex-wrap justify-center gap-3">
+                <button class="bg-gray-100 hover:bg-teal-100 text-gray-700 font-semibold py-2 px-5 rounded-lg border border-gray-300 transition duration-150">
+                    전체 상권
+                </button>
+                <button class="bg-gray-100 hover:bg-teal-100 text-gray-700 font-semibold py-2 px-5 rounded-lg border border-gray-300 transition duration-150">
+                    정문 주변
+                </button>
+                <button class="bg-gray-100 hover:bg-teal-100 text-gray-700 font-semibold py-2 px-5 rounded-lg border border-gray-300 transition duration-150">
+                    서문 주변
+                </button>
+                <button class="bg-gray-100 hover:bg-teal-100 text-gray-700 font-semibold py-2 px-5 rounded-lg border border-gray-300 transition duration-150">
+                    쪽문 주변
+                </button>
+            </div>
+        </div>
+
+    </main>
+    
+    <!-- 2. 프로젝트 소개 섹션 -->
+    <section id="intro" class="bg-gray-50 py-16 sm:py-24 border-t border-b border-gray-100">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6">
+            <h2 class="text-3xl section-title mb-12 text-gray-800">프로젝트 소개</h2>
+            
+            <!-- 여기서 레이아웃을 4열로 변경 -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6"> 
+                <!-- 카드 1: 시작 배경 (헬스장) -->
+                <div class="bg-white p-6 card">
+                    <div class="text-2xl font-bold text-teal-600 mb-3">01. 시작 배경</div>
+                    <h3 class="text-xl font-semibold mb-3">왜 헬스장인가?</h3>
+                    <p class="text-gray-700 text-sm leading-relaxed">
+                        헬스장, 요가 등 체육시설은 장기 선불 계약이 많아 가격 비공개와 환불 분쟁이 가장 심한 업종입니다. 가격을 숨겨 방문을 유도하고 불투명한 계약을 강요하는 관행을 깨기 위해 이 프로젝트를 시작했습니다.
+                    </p>
+                </div>
+
+                <!-- 카드 2: 핵심 목표 (알 권리) -->
+                <div class="bg-white p-6 card">
+                    <div class="text-2xl font-bold text-teal-600 mb-3">02. 핵심 목표</div>
+                    <h3 class="text-xl font-semibold mb-3">소비자 알 권리 & 공정 거래</h3>
+                    <ul class="list-disc list-inside text-gray-700 text-sm space-y-1 pl-2">
+                        <li>소비자의 알 권리 보장 및 정보 투명성 확보</li>
+                        <li>가격 공개를 통한 시장의 공정 거래 질서 정착</li>
+                        <li>윤리적 기업에 대한 소비자의 선택적 보상 유도</li>
+                    </ul>
+                </div>
+                
+                <!-- 카드 3: 윤리적 소비 -->
+                <div class="bg-white p-6 card">
+                    <div class="text-2xl font-bold text-teal-600 mb-3">03. 윤리적 소비</div>
+                    <h3 class="text-xl font-semibold mb-3">우리의 선택이 시장을 바꾼다</h3>
+                    <p class="text-gray-700 text-sm leading-relaxed">
+                        이 지도를 사용하는 당신은 시장 감시자입니다. 정직한 가게를 선택하여 윤리 경영을 보상하고, 비윤리적 행위를 견제함으로써 더 나은 소비 문화 확산에 동참하게 됩니다.
+                    </p>
+                </div>
+                
+                <!-- 카드 4: 조사 방법 및 범위 (추가된 내용) -->
+                <div class="bg-white p-6 card">
+                    <div class="text-2xl font-bold text-teal-600 mb-3">04. 조사 방법 및 범위</div>
+                    <p class="text-gray-700 text-sm leading-relaxed mb-2">
+                        충남대학교 정문/서문/쪽문 도보 10분 거리** 헬스장을 대상으로 정보를 수집했습니다.
+                    </p>
+                    <ul class="list-disc list-inside text-gray-700 text-sm space-y-1 pl-2">
+                        <li>수집 정보: 일일권, 1/3/6개월 회원권, 충대 제휴가, PT 10회 가격</li>
+                        <li>미명시 가게: 직접 전화 문의를 통해 가격 정보를 확보했습니다.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 3. 법적 근거 및 자료실 -->
+    <section id="legal" class="py-16 sm:py-24">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6">
+            <h2 class="text-3xl section-title mb-12 text-gray-800">법적 근거 (공정거래위원회 고시)</h2>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <!-- 핵심 조항 1: 이용료 -->
+                <div class="bg-teal-50 p-6 card border-l-4 border-teal-500">
+                    <p class="font-bold text-lg text-teal-800 mb-2">① 이용료의 명시</p>
+                    <p class="text-sm text-gray-700">기간별/종류별 기본 요금 및 서비스에 필수적인 추가 비용(총금액)을 명확히 표시해야 합니다.</p>
+                </div>
+                <!-- 핵심 조항 2: 환불 기준 -->
+                <div class="bg-teal-50 p-6 card border-l-4 border-teal-500">
+                    <p class="font-bold text-lg text-teal-800 mb-2">② 환불 및 해지 기준</p>
+                    <p class="text-sm text-gray-700">중도 해지 시 환불 금액 산정 기준 및 위약금 조항을 상세하고 쉽게 이해할 수 있도록 고지해야 합니다.</p>
+                </div>
+                <!-- 핵심 조항 3: 접근성 -->
+                <div class="bg-teal-50 p-6 card border-l-4 border-teal-500">
+                    <p class="font-bold text-lg text-teal-800 mb-2">③ 쉬운 접근 경로</p>
+                    <p class="text-sm text-gray-700">소비자가 쉽게 찾을 수 있는 온라인 홈페이지 등에 명확히 표시되어야 하며, 숨기면 안 됩니다.</p>
+                </div>
+            </div>
+
+            <div class="mt-12 text-center text-gray-600">
+                <p class="font-semibold">※ 이 모든 정보는 공정위의 <span class="text-teal-600">「중요한 표시·광고사항 고시」</span>에 근거합니다.</p>
+                <p class="text-sm mt-2">위반 시 「표시·광고의 공정화에 관한 법률」에 따라 과태료 등의 제재를 받을 수 있습니다.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- 푸터 -->
+    <footer class="bg-gray-100 text-gray-600 py-6 mt-10 border-t border-gray-200">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 text-center text-sm">
+            <p>&copy; 충남대학교_ 지속가능한 소비와 리더십_가격 투명성 프로젝트</p>
+            <p class="mt-1">문의: <a href="mailto:you12251129@gmail.com" class="text-teal-600 hover:text-teal-700 underline">you12251129@gmail.com</a></p>
+        </div>
+    </footer>
+
+</body>
+</html>
